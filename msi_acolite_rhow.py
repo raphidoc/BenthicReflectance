@@ -11,6 +11,10 @@ from sentinelsat import SentinelAPI, read_geojson, geojson_to_wkt
 from shapely.geometry import Polygon, box
 import shutil
 import xarray as xr
+from geocube.api.core import make_geocube
+from geocube.rasterize import rasterize_points_griddata, rasterize_points_radial
+from functools import partial
+import numpy as np
 
 # Need the geocube.api.core to make ACOLITE work ? PROJ error otherwise ... https://odnature.naturalsciences.be/remsem/acolite-forum/viewtopic.php?t=319
 # Something usefull to ACOLITE may get mask in the import ...
@@ -27,22 +31,36 @@ from geocube.api.core import make_geocube
 
 class msi_acolite:
 
-    def __init__(self, BBox, Date, CloudCoverPercentage, TmpPath):
+    def __init__(self, Surface, TideHeight, EPSG, Date, CloudCoverPercentage, TmpPath):
 
-        #  Put username and passowrd in an .netrc file in your user home directory in the following form:
+        # Define the SentinelAPI for sentinelsat module (API search and download of satellite images from scihub.copernicus.eu)
+        # Put username and password in an .netrc file in your user home directory in the following form:
         # machine apihub.copernicus.eu
         # login <your username>
         # password <your password>
         self.SentinelAPI = SentinelAPI(None, None, 'https://apihub.copernicus.eu/apihub')
 
-        # Transform BBox to JSON
-        self.BBox = BBox
-        self.BBox = box(*self.BBox)
-        self.BBoxJSON = json.loads(gpd.GeoSeries([self.BBox]).to_json())
-        
+        # EPSG numeric code of surface
+        # EPSG = '2960'
+        self.EPSG = EPSG
+
+        # Convert Surface to Geodataframe
+        self.Surface = Surface
+        self.GeometrySurface = gpd.points_from_xy(self.Surface['x'], self.Surface['y'], crs="EPSG:"+str(self.EPSG))
+        self.gdf = gpd.GeoDataFrame(self.Surface, geometry=self.GeometrySurface)
+
+        # Create BBox from Surface
+        self.BBox = box(*self.gdf.total_bounds)
+        # Convert BBox to WGS84 for satellite image search only
+        self.BBoxJSON = gpd.GeoSeries([self.BBox]).set_crs('EPSG:'+str(self.EPSG)).to_crs('EPSG:4326').to_json()
+        self.BBoxJSON = json.loads(self.BBoxJSON)
+
         self.Date = Date
         self.CloudCoverPercentage = CloudCoverPercentage
         self.TmpPath = TmpPath
+
+        # Optional TideHeight to use H (water column height) instead of Z (bottom altitude)
+        self.TidelHeight = TideHeight
 
     # Download the Sentinel-2 MSI data from Copernicus Hub
     def download_L1c(self):
@@ -121,12 +139,12 @@ class msi_acolite:
                            "output":AcolitePath,
                            "polygon":TmpGeojson,
                            "polygon_limit":True,
-                           "l2w_parameters":['rhow_*'],
+                           "l2w_parameters":['rhow_*', 'p3qaa_Kd_*'],
                            "s2_target_res":10,
-                           #"output_xy":True,
-                           # #"reproject_before_ac":True,
-                           # #"output_projection_epsg":2960,
-                           # "dsf_residual_glint_correction":True
+                           "output_xy":True,
+                           "reproject_before_ac":True,
+                           "output_projection_epsg":self.EPSG,
+                           "dsf_residual_glint_correction":True
                            }
 
         AcoliteResult = ac.acolite.acolite_run(settings=acolitesettings)
@@ -139,7 +157,53 @@ class msi_acolite:
         #df.to_csv(os.path.join(AcolitePath,DownloadResult[0][UUID]["title"]+"L2W.xy"), sep=',', header=True, index=False)
 
         # Write to x,y,rhow_*wavelength* to sys.stdout
-        df.to_csv(sys.stdout, sep=',', header=True, index=False)
+        #df.to_csv(sys.stdout, sep=',', header=True, index=False)
 
         # Return the dataframe with the water reflectance values, one line per pixel
-        return df
+        return L2Array
+
+    def get_rhob(self):
+
+        RhoW = self.get_rhow()
+
+        print('Rasterizing xyz surface')
+        Hraster = make_geocube(
+            self.gdf,
+            measurements=["z"],
+            resolution=(10, 10),
+            rasterize_function=partial(rasterize_points_griddata, method="linear"),
+        )
+        print('Done')
+
+        # Add the water level (H) to the bottom altitude (Z)
+        # Should check the sign (Z as positive or negative ?)
+        Hraster['z'] = Hraster['z']+self.TidelHeight
+
+        Combined = xr.combine_by_coords([RhoW, Hraster], combine_attrs='override')
+
+        BRI492 = Combined['rhow_492']/np.exp(-Combined['z']*Combined['p3qaa_Kd_492'])
+        BRI559 = Combined['rhow_559']/np.exp(-Combined['z']*Combined['p3qaa_Kd_559'])
+        BRI665 = Combined['rhow_665']/np.exp(-Combined['z']*Combined['p3qaa_Kd_665'])
+
+        DF492 = (
+            BRI492
+            .to_dataframe(name='BRI_492')
+            .reset_index()
+        )[['y','x','BRI_492']]
+
+        DF559 = (
+            BRI559
+            .to_dataframe(name='BRI_559')
+            .reset_index()
+        )[['y','x','BRI_559']]
+
+        DF665 = (
+            BRI665
+            .to_dataframe(name='BRI_665')
+            .reset_index()
+        )[['y','x','BRI_665']]
+
+        Merged = DF492.merge(DF559, on=('y','x'), how='left')
+        Merged = Merged.merge(DF665, on=('y', 'x'), how='left')
+
+        Merged.to_csv(sys.stdout, sep=',', header=True, index=False)
